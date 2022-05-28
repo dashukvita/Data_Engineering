@@ -1,58 +1,74 @@
-import datetime as dt
+import logging
+
 import requests
+from datetime import datetime
 from airflow import DAG
-from airflow.operators.dummy_operator import DummyOperator
-from airflow.operators.python_operator import PythonOperator
+from airflow.operators.postgres_operator import PostgresOperator
 from airflow.hooks.postgres_hook import PostgresHook
-from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.dummy_operator import DummyOperator
 
-args = {
-    'owner': 'airflow',
-    'start_date': dt.datetime(2022, 5, 24, 0, 30),
-    'depends_on_past': False,
-}
+COORDINATES_API_URL = 'http://api.open-notify.org/iss-now.json'
 
-def insert_data():
-    # getting data
-    url = 'http://api.open-notify.org/iss-now.json'
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
-    data = response.json()
+def _get_data(**context):
+    api_req = requests.request("GET", COORDINATES_API_URL,
+                               headers={'Content-Type': 'application/json; charset=utf-8'}, data={})
 
-    # creating a connection and inserting data into the database
-    try:
-        query = "INSERT INTO STATION_COORDINATES (TIMESTAMP, MESSAGE, latitude, LONGITUDE) " \
-                "VALUES ('{0}', '{1}', '{2}', '{3}');" \
-            .format(data['timestamp'], data['message'], data['iss_position']['latitude'], data['iss_position']['longitude'])
+    api_json = api_req.json()
+    context["task_instance"].xcom_push(key="api_json", value=api_json)
 
-        pg_hook = PostgresHook(postgres_conn_id='postgres_db', shema='analytics')
-        pg_hook.log.info(data['timestamp'])
-        pg_hook.run(query)
 
-    except Exception as e:
-        pg_hook.log.info('An exception occurred with following data: {0}'.format(data))
-        return 1
+def _parse_data(**context):
+    api_json = context["task_instance"].xcom_pull(
+        task_ids="get_data", key="api_json")
+    api_data = [api_json['timestamp'], api_json['message'],
+                api_json['iss_position']['latitude'], api_json['iss_position']['longitude']]
+    context["task_instance"].xcom_push(key="api_data", value=api_data)
 
-with DAG(
-        dag_id='getting_station_coordinates',
-        default_args=args,
-        schedule_interval="*/30 * * * *"
-) as dag:
-    start_task = DummyOperator(task_id='start_task')
-    create_table = PostgresOperator(
-        task_id="create_table",
-        postgres_conn_id='postgres_db',
-        sql="""
-            CREATE TABLE IF NOT EXISTS STATION_COORDINATES (
-                TIMESTAMP   INTEGER PRIMARY KEY NOT NULL,
-                MESSAGE     VARCHAR,
-                LATITUDE    VARCHAR,
-                LONGITUDE   VARCHAR);
-          """,
-    )
-    insert_data = PythonOperator(
-        task_id='insert_data',
-        python_callable=insert_data,
-        dag=dag
-    )
-    start_task >> create_table >> insert_data
+
+def _insert_data(**context):
+    api_data = context["task_instance"].xcom_pull(
+        task_ids="parse_data", key="api_data")
+    dest = PostgresHook(postgres_conn_id='postgres_db')
+    logging.info(api_data)
+    dest_conn = dest.get_conn()
+    dest_cursor = dest_conn.cursor()
+    dest_cursor.execute(
+        """INSERT INTO station_data(timestamp, message, latitude, longitude) VALUES (%s, %s, %s, %s)""", (api_data))
+    dest_conn.commit()
+
+
+args = {'owner': 'airflow'}
+
+dag = DAG(
+    dag_id="get_station_coordinates",
+    default_args=args,
+    start_date=datetime(2021, 7, 1),
+    schedule_interval='*/30 * * * *',
+    catchup=False,
+)
+
+
+start = DummyOperator(task_id="start", dag=dag)
+
+get_data = PythonOperator(
+    task_id='get_data', python_callable=_get_data, provide_context=True, dag=dag)
+parse_data = PythonOperator(
+    task_id='parse_data', python_callable=_parse_data, provide_context=True, dag=dag)
+insert_data = PythonOperator(
+    task_id='insert_data', python_callable=_insert_data, provide_context=True, dag=dag)
+
+create_table = PostgresOperator(
+    task_id='create_table',
+    postgres_conn_id="postgres_db",
+    sql='''CREATE TABLE IF NOT EXISTS station_data(
+            date_load     timestamp NOT NULL DEFAULT NOW()::timestamp,
+            timestamp     integer PRIMARY KEY NOT NULL,
+            message       varchar,
+            latitude      decimal,
+            longitude     decimal);
+            ''', dag=dag
+)
+
+
+start >> create_table >> get_data >> parse_data >> insert_data
