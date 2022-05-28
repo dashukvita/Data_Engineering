@@ -15,7 +15,11 @@ def _get_data(**context):
                                headers={'Content-Type': 'application/json; charset=utf-8'}, data={})
 
     api_json = api_req.json()
-    context["task_instance"].xcom_push(key="api_json", value=api_json)
+    if api_json['message'] == 'success':
+        context["task_instance"].xcom_push(key="api_json", value=api_json)
+    else:
+        logging.info('Getting failed data: {0}'.api_json)
+    return 1
 
 
 def _parse_data(**context):
